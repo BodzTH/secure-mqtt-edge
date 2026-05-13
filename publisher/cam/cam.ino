@@ -60,15 +60,10 @@ const char* image_topic   = "esp32cam/encrypted_image";
 // =====================================================
 
 // AES128 key (16 bytes)
-const unsigned char aes_key[16] = {
-  0x10,0x22,0x33,0x44,
-  0x55,0x66,0x77,0x88,
-  0x99,0xaa,0xbb,0xcc,
-  0xdd,0xee,0xff,0x11
-};
+const unsigned char aes_key[16] = SECRET_AES_KEY;
 
 // HMAC key
-const unsigned char hmac_key[] = "ESP32_SECRET_HMAC_KEY";
+const unsigned char hmac_key[] = SECRET_HMAC_KEY;
 
 // =====================================================
 // FLASH LED
