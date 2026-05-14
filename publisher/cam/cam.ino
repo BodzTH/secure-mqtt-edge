@@ -1,5 +1,5 @@
 /*******************************************************
-   ESP32-CAM SECURE MQTT IMAGE TRANSMISSION
+   ESP32-CAM SECURE MQTT IMAGE TRANSMISSION (UPDATED)
    ------------------------------------------------
    Features:
    - Request-based image capture
@@ -7,6 +7,8 @@
    - HMAC-SHA256 integrity/authentication
    - MQTT publisher/subscriber (ArduinoMqttClient)
    - Binary packet transmission
+   - Fixed: Stale frame buffer flush
+   - Fixed: PSRAM allocation for encryption buffers
 
    Packet Structure:
    ------------------------------------------------
@@ -230,7 +232,8 @@ bool encryptAES(
 
   *encrypted_len = padded_len;
 
-  *encrypted_output = (uint8_t*) malloc(padded_len);
+  // [FIX:] Use ps_malloc instead of malloc to utilize external RAM
+  *encrypted_output = (uint8_t*) ps_malloc(padded_len);
 
   if (!(*encrypted_output)) {
     Serial.println("Encryption malloc failed");
@@ -321,6 +324,16 @@ void captureAndSendSecureImage() {
   digitalWrite(FLASH_LED_PIN, HIGH);
   delay(100);
 
+  // [FIX:] Grab the stale frame currently sitting in the buffer
+  camera_fb_t * old_fb = esp_camera_fb_get();
+  if (old_fb) {
+    esp_camera_fb_return(old_fb); // Throw it away immediately
+  }
+
+  // [FIX:] Allow a tiny delay for the sensor to adjust exposure to the flash LED
+  delay(150); 
+
+  // [FIX:] Grab the FRESH, real-time frame
   camera_fb_t * fb = esp_camera_fb_get();
 
   digitalWrite(FLASH_LED_PIN, LOW);
@@ -372,7 +385,8 @@ void captureAndSendSecureImage() {
 
   size_t packet_size = 32 + 16 + encrypted_len;
 
-  uint8_t* final_packet = (uint8_t*) malloc(packet_size);
+  // [FIX:] Use ps_malloc instead of malloc to utilize external RAM
+  uint8_t* final_packet = (uint8_t*) ps_malloc(packet_size);
 
   if (!final_packet) {
     Serial.println("Packet malloc failed");
