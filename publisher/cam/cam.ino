@@ -326,6 +326,7 @@ void captureAndSendSecureImage() {
   digitalWrite(FLASH_LED_PIN, LOW);
 
   if (!fb) {
+
     Serial.println("Capture failed");
     return;
   }
@@ -333,79 +334,130 @@ void captureAndSendSecureImage() {
   Serial.printf("Image size: %d bytes\n", fb->len);
 
   // =================================================
-  // STEP 1 -> HMAC
-  // =================================================
-
-  unsigned char hmac_output[32];
-
-  if (!generateHMAC(fb->buf, fb->len, hmac_output)) {
-    esp_camera_fb_return(fb);
-    return;
-  }
-
-  Serial.println("HMAC generated");
-
-  // =================================================
-  // STEP 2 -> IV
+  // STEP 1 -> GENERATE RANDOM IV
   // =================================================
 
   unsigned char iv[16];
+
   generateIV(iv);
 
   // =================================================
-  // STEP 3 -> AES ENCRYPT
+  // STEP 2 -> AES ENCRYPT IMAGE
   // =================================================
 
   uint8_t* encrypted_data = NULL;
+
   size_t encrypted_len = 0;
 
-  if (!encryptAES(fb->buf, fb->len, iv, &encrypted_data, &encrypted_len)) {
+  if (!encryptAES(
+        fb->buf,
+        fb->len,
+        iv,
+        &encrypted_data,
+        &encrypted_len
+      )) {
+
+    Serial.println("Encryption failed");
+
     esp_camera_fb_return(fb);
+
     return;
   }
 
   Serial.println("Image encrypted");
 
   // =================================================
-  // STEP 4 -> CREATE FINAL PACKET
+  // STEP 3 -> HMAC OVER CIPHERTEXT
   // =================================================
 
-  size_t packet_size = 32 + 16 + encrypted_len;
+  unsigned char hmac_output[32];
 
-  uint8_t* final_packet = (uint8_t*) malloc(packet_size);
+  if (!generateHMAC(
+        encrypted_data,
+        encrypted_len,
+        hmac_output
+      )) {
 
-  if (!final_packet) {
-    Serial.println("Packet malloc failed");
+    Serial.println("HMAC generation failed");
+
     free(encrypted_data);
+
     esp_camera_fb_return(fb);
+
     return;
   }
 
-  // [HMAC]
-  memcpy(final_packet, hmac_output, 32);
-
-  // [IV]
-  memcpy(final_packet + 32, iv, 16);
-
-  // [Encrypted Data]
-  memcpy(final_packet + 48, encrypted_data, encrypted_len);
+  Serial.println("HMAC generated over ciphertext");
 
   // =================================================
-  // STEP 5 -> MQTT PUBLISH (ArduinoMqttClient)
+  // STEP 4 -> CREATE FINAL PACKET
   // =================================================
 
-  // Set the message payload size first so the library knows how much to stream
-  mqttClient.beginMessage(image_topic, (unsigned long)packet_size, false, 0, false);  
-  // Write the entire payload to the outgoing buffer/stream
-  mqttClient.write(final_packet, packet_size);
-  
-  // Close the message and trigger the send
-  int success = mqttClient.endMessage();
+  size_t packet_size =
+    32 + 16 + encrypted_len;
+
+  uint8_t* final_packet =
+    (uint8_t*) malloc(packet_size);
+
+  if (!final_packet) {
+
+    Serial.println("Packet malloc failed");
+
+    free(encrypted_data);
+
+    esp_camera_fb_return(fb);
+
+    return;
+  }
+
+  // =================================================
+  // PACKET STRUCTURE
+  // [32B HMAC][16B IV][CIPHERTEXT]
+  // =================================================
+
+  memcpy(final_packet,
+         hmac_output,
+         32);
+
+  memcpy(final_packet + 32,
+         iv,
+         16);
+
+  memcpy(final_packet + 48,
+         encrypted_data,
+         encrypted_len);
+
+  // =================================================
+  // STEP 5 -> MQTT PUBLISH
+  // =================================================
+
+  mqttClient.beginMessage(
+    image_topic,
+    (unsigned long)packet_size,
+    false,
+    0,
+    false
+  );
+
+  mqttClient.write(
+    final_packet,
+    packet_size
+  );
+
+  int success =
+    mqttClient.endMessage();
 
   if (success) {
-    Serial.println("Encrypted image published successfully");
+
+    Serial.println(
+      "Encrypted image published successfully"
+    );
+
   } else {
-    Serial.println("MQTT publish failed");
+
+    Serial.println(
+      "MQTT publish failed"
+    );
   }
 
   // =================================================
@@ -413,10 +465,11 @@ void captureAndSendSecureImage() {
   // =================================================
 
   free(encrypted_data);
+
   free(final_packet);
+
   esp_camera_fb_return(fb);
 }
-
 // =====================================================
 // MQTT CALLBACK (ArduinoMqttClient style)
 // =====================================================
