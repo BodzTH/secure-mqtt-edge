@@ -1,14 +1,13 @@
 /*******************************************************
-   ESP32-CAM SECURE MQTT IMAGE TRANSMISSION (UPDATED)
+   ESP32-CAM SECURE MQTT IMAGE TRANSMISSION (OPTIMIZED)
    ------------------------------------------------
    Features:
    - Request-based image capture
    - AES128-CBC encryption
-   - HMAC-SHA256 integrity/authentication
+   - HMAC-SHA256 integrity/authentication (Encrypt-then-MAC)
    - MQTT publisher/subscriber (ArduinoMqttClient)
-   - Binary packet transmission
-   - Fixed: Stale frame buffer flush
-   - Fixed: PSRAM allocation for encryption buffers
+   - Fixed: Stale frame buffer flush (No more dark photos)
+   - Fixed: PSRAM allocation (Prevents memory crash on large images)
 
    Packet Structure:
    ------------------------------------------------
@@ -22,8 +21,8 @@
 
    ESP32:
        Capture image
-       Generate HMAC-SHA256
        AES128 encrypt image
+       Generate HMAC-SHA256 over ciphertext
        Publish secure packet
 
    Output Topic:
@@ -106,9 +105,7 @@ MqttClient mqttClient(espClient);
 // =====================================================
 
 void connectWiFi() {
-
   WiFi.begin(ssid, password);
-
   Serial.print("Connecting to WiFi");
 
   while (WiFi.status() != WL_CONNECTED) {
@@ -116,8 +113,7 @@ void connectWiFi() {
     Serial.print(".");
   }
 
-  Serial.println();
-  Serial.println("WiFi connected");
+  Serial.println("\nWiFi connected");
   Serial.print("IP Address: ");
   Serial.println(WiFi.localIP());
 }
@@ -127,29 +123,20 @@ void connectWiFi() {
 // =====================================================
 
 void connectMQTT() {
-
   while (!mqttClient.connected()) {
-
     Serial.print("Connecting to MQTT...");
 
     String clientID = "ESP32CAM-";
     clientID += String(random(0xffff), HEX);
-    
     mqttClient.setId(clientID);
 
     if (mqttClient.connect(mqtt_server, mqtt_port)) {
-
       Serial.println("connected");
-
       mqttClient.subscribe(request_topic);
-
       Serial.println("Subscribed to request topic");
-
     } else {
-
       Serial.print("failed, error code = ");
       Serial.println(mqttClient.connectError());
-
       delay(2000);
     }
   }
@@ -160,9 +147,7 @@ void connectMQTT() {
 // =====================================================
 
 void setupCamera() {
-
   camera_config_t config;
-
   config.ledc_channel = LEDC_CHANNEL_0;
   config.ledc_timer = LEDC_TIMER_0;
 
@@ -179,32 +164,22 @@ void setupCamera() {
   config.pin_pclk = PCLK_GPIO_NUM;
   config.pin_vsync = VSYNC_GPIO_NUM;
   config.pin_href = HREF_GPIO_NUM;
-
   config.pin_sccb_sda = SIOD_GPIO_NUM;
   config.pin_sccb_scl = SIOC_GPIO_NUM;
-
   config.pin_pwdn = PWDN_GPIO_NUM;
   config.pin_reset = RESET_GPIO_NUM;
-
   config.xclk_freq_hz = 20000000;
-
   config.pixel_format = PIXFORMAT_JPEG;
 
-  // Lower size for memory safety
   config.frame_size = FRAMESIZE_QVGA;
-
   config.jpeg_quality = 20;
-
   config.fb_count = 1;
 
   esp_err_t err = esp_camera_init(&config);
-
   if (err != ESP_OK) {
-
     Serial.printf("Camera init failed: 0x%x\n", err);
     return;
   }
-
   Serial.println("Camera initialized");
 }
 
@@ -227,16 +202,14 @@ bool encryptAES(
   uint8_t** encrypted_output,
   size_t* encrypted_len
 ) {
-
   size_t padded_len = ((input_len / 16) + 1) * 16;
-
   *encrypted_len = padded_len;
 
-  // [FIX:] Use ps_malloc instead of malloc to utilize external RAM
+  // [FIX 1] Use ps_malloc to utilize the 4MB external PSRAM
   *encrypted_output = (uint8_t*) ps_malloc(padded_len);
 
   if (!(*encrypted_output)) {
-    Serial.println("Encryption malloc failed");
+    Serial.println("Encryption malloc failed (Out of memory)");
     return false;
   }
 
@@ -245,7 +218,6 @@ bool encryptAES(
 
   // PKCS7 Padding
   uint8_t pad = padded_len - input_len;
-
   for (size_t i = input_len; i < padded_len; i++) {
     (*encrypted_output)[i] = pad;
   }
@@ -270,7 +242,6 @@ bool encryptAES(
         *encrypted_output,
         *encrypted_output
       ) != 0) {
-
     Serial.println("AES encryption failed");
     mbedtls_aes_free(&aes);
     return false;
@@ -289,7 +260,6 @@ bool generateHMAC(
   size_t data_len,
   unsigned char* output_hash
 ) {
-
   const mbedtls_md_info_t* md_info = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
 
   if (!md_info) {
@@ -305,11 +275,9 @@ bool generateHMAC(
         data_len,
         output_hash
       ) != 0) {
-
     Serial.println("HMAC generation failed");
     return false;
   }
-
   return true;
 }
 
@@ -318,24 +286,22 @@ bool generateHMAC(
 // =====================================================
 
 void captureAndSendSecureImage() {
-
   Serial.println("Capturing image...");
 
   digitalWrite(FLASH_LED_PIN, HIGH);
   delay(100);
 
-  // [FIX:] Grab the stale frame currently sitting in the buffer
+  // [FIX 2] Flush the stale frame out of the camera buffer
   camera_fb_t * old_fb = esp_camera_fb_get();
   if (old_fb) {
-    esp_camera_fb_return(old_fb); // Throw it away immediately
+    esp_camera_fb_return(old_fb);
   }
 
-  // [FIX:] Allow a tiny delay for the sensor to adjust exposure to the flash LED
-  delay(150); 
+  // Allow the auto-exposure to adjust to the flash LED
+  delay(150);
 
-  // [FIX:] Grab the FRESH, real-time frame
+  // Grab the actual, properly exposed frame
   camera_fb_t * fb = esp_camera_fb_get();
-
   digitalWrite(FLASH_LED_PIN, LOW);
 
   if (!fb) {
@@ -346,46 +312,43 @@ void captureAndSendSecureImage() {
   Serial.printf("Image size: %d bytes\n", fb->len);
 
   // =================================================
-  // STEP 1 -> HMAC
+  // STEP 1 -> GENERATE RANDOM IV
   // =================================================
-
-  unsigned char hmac_output[32];
-
-  if (!generateHMAC(fb->buf, fb->len, hmac_output)) {
-    esp_camera_fb_return(fb);
-    return;
-  }
-
-  Serial.println("HMAC generated");
-
-  // =================================================
-  // STEP 2 -> IV
-  // =================================================
-
   unsigned char iv[16];
   generateIV(iv);
 
   // =================================================
-  // STEP 3 -> AES ENCRYPT
+  // STEP 2 -> AES ENCRYPT IMAGE
   // =================================================
-
   uint8_t* encrypted_data = NULL;
   size_t encrypted_len = 0;
 
   if (!encryptAES(fb->buf, fb->len, iv, &encrypted_data, &encrypted_len)) {
+    Serial.println("Encryption failed");
     esp_camera_fb_return(fb);
     return;
   }
-
   Serial.println("Image encrypted");
+
+  // =================================================
+  // STEP 3 -> HMAC OVER CIPHERTEXT (Encrypt-then-MAC)
+  // =================================================
+  unsigned char hmac_output[32];
+
+  if (!generateHMAC(encrypted_data, encrypted_len, hmac_output)) {
+    Serial.println("HMAC generation failed");
+    free(encrypted_data);
+    esp_camera_fb_return(fb);
+    return;
+  }
+  Serial.println("HMAC generated over ciphertext");
 
   // =================================================
   // STEP 4 -> CREATE FINAL PACKET
   // =================================================
-
   size_t packet_size = 32 + 16 + encrypted_len;
 
-  // [FIX:] Use ps_malloc instead of malloc to utilize external RAM
+  // [FIX 3] Use ps_malloc for the final packet buffer as well
   uint8_t* final_packet = (uint8_t*) ps_malloc(packet_size);
 
   if (!final_packet) {
@@ -395,25 +358,21 @@ void captureAndSendSecureImage() {
     return;
   }
 
-  // [HMAC]
+  // [32B HMAC]
   memcpy(final_packet, hmac_output, 32);
 
-  // [IV]
+  // [16B IV]
   memcpy(final_packet + 32, iv, 16);
 
   // [Encrypted Data]
   memcpy(final_packet + 48, encrypted_data, encrypted_len);
 
   // =================================================
-  // STEP 5 -> MQTT PUBLISH (ArduinoMqttClient)
+  // STEP 5 -> MQTT PUBLISH
   // =================================================
-
-  // Set the message payload size first so the library knows how much to stream
-  mqttClient.beginMessage(image_topic, (unsigned long)packet_size, false, 0, false);  
-  // Write the entire payload to the outgoing buffer/stream
+  mqttClient.beginMessage(image_topic, (unsigned long)packet_size, false, 0, false);
   mqttClient.write(final_packet, packet_size);
   
-  // Close the message and trigger the send
   int success = mqttClient.endMessage();
 
   if (success) {
@@ -425,22 +384,18 @@ void captureAndSendSecureImage() {
   // =================================================
   // CLEANUP
   // =================================================
-
   free(encrypted_data);
   free(final_packet);
   esp_camera_fb_return(fb);
 }
 
 // =====================================================
-// MQTT CALLBACK (ArduinoMqttClient style)
+// MQTT CALLBACK 
 // =====================================================
 
 void onMqttMessage(int messageSize) {
-
-  // Read the topic of the incoming message
   String topic = mqttClient.messageTopic();
   
-  // Read the payload
   String message = "";
   while (mqttClient.available()) {
     message += (char)mqttClient.read();
@@ -462,7 +417,6 @@ void onMqttMessage(int messageSize) {
 // =====================================================
 
 void setup() {
-
   Serial.begin(115200);
   delay(2000);
 
@@ -472,18 +426,13 @@ void setup() {
   if (psramFound()) {
     Serial.println("PSRAM found");
   } else {
-    Serial.println("PSRAM NOT found");
+    Serial.println("PSRAM NOT found - WARNING: Encryption may fail due to low memory!");
   }
 
   setupCamera();
-
   connectWiFi();
 
-  // Set up the message receive callback
   mqttClient.onMessage(onMqttMessage);
-  
-  // Ensure we allocate enough Tx buffer size for the large packet headers. 
-  // We set it to a moderately high size. The actual payload gets streamed.
   mqttClient.setTxPayloadSize(60000); 
 
   connectMQTT();
@@ -494,7 +443,6 @@ void setup() {
 // =====================================================
 
 void loop() {
-
   if (WiFi.status() != WL_CONNECTED) {
     connectWiFi();
   }
@@ -503,6 +451,5 @@ void loop() {
     connectMQTT();
   }
 
-  // Poll handles incoming messages and keep-alives
   mqttClient.poll();
 }
